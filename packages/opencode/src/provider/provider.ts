@@ -813,6 +813,65 @@ export namespace Provider {
             },
           },
         }),
+      ollama: Effect.fnUntraced(function* (input: Info) {
+        const config = (yield* dep.config()).ollama
+        let host = config?.host || "http://127.0.0.1"
+        if (!host.startsWith("http://") && !host.startsWith("https://")) {
+          host = `http://${host}`
+        }
+        const port = config?.port ?? 11434
+        const baseURL = `${host}:${port}/api`
+
+        return {
+          autoload: true,
+          options: {
+            baseURL,
+          },
+          async discoverModels(): Promise<Record<string, Model>> {
+            try {
+              log.info("Fetching ollama tags", { baseURL })
+              const response = await fetch(`${baseURL}/tags`)
+              const data = await response.json()
+              const models: Record<string, Model> = {}
+              for (const model of data.models) {
+                models[model.name] = {
+                  id: ModelID.make(model.name),
+                  providerID: ProviderID.make("ollama"),
+                  name: model.name,
+                  api: {
+                    id: model.name,
+                    url: baseURL,
+                    npm: "@ai-sdk/openai-compatible",
+                  },
+                  status: "active",
+                  headers: {},
+                  options: {},
+                  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                  limit: { context: 8192, output: 2048 },
+                  capabilities: {
+                    temperature: true,
+                    reasoning: false,
+                    attachment: true,
+                    toolcall: true,
+                    input: { text: true, audio: false, image: true, video: false, pdf: false },
+                    output: { text: true, audio: false, image: false, video: false, pdf: false },
+                    interleaved: false,
+                  },
+                  release_date: model.modified_at,
+                  variants: {},
+                }
+              }
+              return models
+            } catch (e) {
+              log.warn("ollama model discovery failed", { error: e })
+              return {}
+            }
+          },
+          async getModel(sdk: any, modelID: string) {
+            return sdk.chat(modelID)
+          },
+        }
+      }),
     }
   }
 
@@ -1203,16 +1262,43 @@ export namespace Provider {
           for (const [id, fn] of Object.entries(custom(dep))) {
             const providerID = ProviderID.make(id)
             if (disabled.has(providerID)) continue
-            const data = database[providerID]
+
+            // For ollama, we allow it even if it's not in database (since models are discovered dynamically)
+            const isOllama = providerID === "ollama"
+            let data = database[providerID]
+
             if (!data) {
-              log.error("Provider does not exist in model list " + providerID)
-              continue
+              if (isOllama) {
+                // Mock a default provider info for ollama
+                data = {
+                  id: providerID,
+                  name: "Ollama",
+                  source: "custom",
+                  env: [],
+                  options: {},
+                  models: {},
+                }
+                database[providerID] = data
+              } else {
+                log.error("Provider does not exist in model list " + providerID)
+                continue
+              }
             }
+
+            log.info("Processing custom provider", { providerID, hasData: !!data })
             const result = yield* fn(data)
             if (result && (result.autoload || providers[providerID])) {
+              log.info("Custom provider autoloaded", {
+                providerID,
+                autoload: result.autoload,
+                exists: !!providers[providerID],
+              })
               if (result.getModel) modelLoaders[providerID] = result.getModel
               if (result.vars) varsLoaders[providerID] = result.vars
-              if (result.discoverModels) discoveryLoaders[providerID] = result.discoverModels
+              if (result.discoverModels) {
+                log.info("added discovery loader", { providerID })
+                discoveryLoaders[providerID] = result.discoverModels
+              }
               const opts = result.options ?? {}
               const patch: Partial<Info> = providers[providerID]
                 ? { options: opts }
@@ -1231,20 +1317,36 @@ export namespace Provider {
             mergeProvider(providerID, partial)
           }
 
-          const gitlab = ProviderID.make("gitlab")
-          if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
-            yield* Effect.promise(async () => {
+          // Run discovery for all providers that have a loader
+          const discoveryPromises = Object.entries(discoveryLoaders).map(([id, loader]) => {
+            log.info("Checking discovery loader", {
+              id,
+              hasProvider: !!providers[id as ProviderID],
+              allowed: isProviderAllowed(id as ProviderID),
+            })
+            if (!providers[id as ProviderID] || !isProviderAllowed(id as ProviderID)) return Effect.void
+
+            return Effect.promise(async () => {
+              log.info("Running discovery loader", { id })
               try {
-                const discovered = await discoveryLoaders[gitlab]()
+                const discovered = await loader()
                 for (const [modelID, model] of Object.entries(discovered)) {
-                  if (!providers[gitlab].models[modelID]) {
-                    providers[gitlab].models[modelID] = model
+                  if (!providers[id as ProviderID].models[modelID]) {
+                    providers[id as ProviderID].models[modelID] = model
                   }
                 }
               } catch (e) {
-                log.warn("state discovery error", { id: "gitlab", error: e })
+                log.warn("state discovery error", { id, error: e })
               }
             })
+          })
+
+          yield* Effect.all(discoveryPromises, { concurrency: "unbounded" })
+
+          const gitlab = ProviderID.make("gitlab")
+          if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
+            // GitLab is already handled above by the generic loop, but keep here if needed for specific logic.
+            // Or remove redundant logic if generic loop suffices.
           }
 
           for (const hook of plugins) {
